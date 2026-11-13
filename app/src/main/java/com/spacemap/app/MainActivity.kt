@@ -3,6 +3,8 @@ package com.spacemap.app
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.AppOpsManager
+import android.app.usage.StorageStatsManager
 import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -18,8 +20,10 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.os.Process
 import android.os.StatFs
 import android.os.SystemClock
+import android.os.storage.StorageManager
 import android.provider.Settings
 import android.text.TextUtils
 import android.text.format.Formatter
@@ -39,11 +43,20 @@ import androidx.core.content.FileProvider
 import java.io.File
 import java.util.concurrent.Executors
 
-class Item(val file: File, val size: Long, val isDir: Boolean, val count: Int, val locked: Boolean)
+class Item(
+    val file: File,
+    val size: Long,
+    val isDir: Boolean,
+    val count: Int,
+    val locked: Boolean,
+    val virtual: Boolean = false,
+    val label: String? = null
+)
 
 class MainActivity : Activity() {
 
     private val TRASH = ".SpaceMapTrash"
+    private val REST = "__rest__"
     private val ex = Executors.newFixedThreadPool(2)
     private val h = Handler(Looper.getMainLooper())
     private val root: File = Environment.getExternalStorageDirectory()
@@ -56,6 +69,8 @@ class MainActivity : Activity() {
     private var scanId = 0
     private var scanning = false
     private var denied = false
+    private var appsMode = false
+    private var rootState = 0
     private var totalDev = 1L
     private var usedDev = 0L
     private var trashCounter = 0
@@ -105,6 +120,7 @@ class MainActivity : Activity() {
         return lp
     }
 
+    // ---------- الصلاحيات ----------
     private fun hasAccess(): Boolean {
         return if (Build.VERSION.SDK_INT >= 30) Environment.isExternalStorageManager()
         else checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == 0
@@ -129,6 +145,137 @@ class MainActivity : Activity() {
                     Manifest.permission.WRITE_EXTERNAL_STORAGE
                 ), 1
             )
+        }
+    }
+
+    private fun usageGranted(): Boolean {
+        return try {
+            val ao = getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+            val m = ao.checkOpNoThrow(
+                AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), packageName
+            )
+            m == AppOpsManager.MODE_ALLOWED
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun askUsageAccess() {
+        AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
+            .setTitle("صلاحية الوصول إلى بيانات الاستخدام")
+            .setMessage("لعرض أحجام التطبيقات وبياناتها (Android/data) فعّل هذه الصلاحية لتطبيق «خريطة المساحة» ثم ارجع.")
+            .setPositiveButton("فتح الإعدادات") { _, _ ->
+                try {
+                    startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+                } catch (e: Exception) {
+                }
+            }
+            .setNegativeButton("إلغاء", null)
+            .show()
+    }
+
+    // ---------- الروت ----------
+    private fun q(s: String): String = s.replace("'", "'\\''")
+
+    private fun sh(cmd: String): List<String>? {
+        return try {
+            val p = ProcessBuilder("su", "-c", cmd).redirectErrorStream(true).start()
+            val out = p.inputStream.bufferedReader().readLines()
+            p.waitFor()
+            out
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun hasRoot(): Boolean {
+        if (rootState == 0) {
+            val r = sh("id")
+            rootState = if (r != null && r.any { l -> l.contains("uid=0") }) 1 else 2
+        }
+        return rootState == 1
+    }
+
+    private fun rootSize(f: File): Long {
+        val r = sh("du -sk '" + q(f.path) + "' 2>/dev/null | cut -f1")
+        val v = r?.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+        return v * 1024L
+    }
+
+    private fun rootList(dir: File): List<Item> {
+        val cmd = "cd '" + q(dir.path) + "' 2>/dev/null && " +
+                "for f in * .[!.]* ..?*; do " +
+                "if [ -L \"\$f\" ]; then continue; fi; " +
+                "[ -e \"\$f\" ] || continue; " +
+                "if [ -d \"\$f\" ]; then echo \"d|\$(du -sk \"\$f\" 2>/dev/null | cut -f1)|\$f\"; " +
+                "else echo \"f|\$(stat -c %s \"\$f\" 2>/dev/null)|\$f\"; fi; done"
+        val out = ArrayList<Item>()
+        val lines = sh(cmd) ?: return out
+        for (ln in lines) {
+            val p = ln.split("|", limit = 3)
+            if (p.size < 3) continue
+            val isD = p[0] == "d"
+            var sz = p[1].trim().toLongOrNull() ?: 0L
+            if (isD) sz *= 1024L
+            out.add(Item(File(dir, p[2]), sz, isD, -1, false))
+        }
+        return out
+    }
+
+    private fun forceDelete(f: File): Boolean {
+        if (f.deleteRecursively()) return true
+        if (hasRoot()) {
+            sh("rm -rf '" + q(f.path) + "'")
+            return true
+        }
+        return false
+    }
+
+    // ---------- التطبيقات ----------
+    private fun buildApps(dir: File): List<Item> {
+        val out = ArrayList<Item>()
+        try {
+            val ssm = getSystemService(Context.STORAGE_STATS_SERVICE) as StorageStatsManager
+            val pm = packageManager
+            for (ai in pm.getInstalledApplications(0)) {
+                try {
+                    val s = ssm.queryStatsForPackage(
+                        StorageManager.UUID_DEFAULT, ai.packageName, Process.myUserHandle()
+                    )
+                    val total = s.appBytes + s.dataBytes + s.cacheBytes
+                    val name = pm.getApplicationLabel(ai).toString() + "  (" + ai.packageName + ")"
+                    out.add(Item(File(dir, ai.packageName), total, true, 0, false, true, name))
+                } catch (e: Exception) {
+                }
+            }
+        } catch (e: Exception) {
+        }
+        return out
+    }
+
+    private fun showApps() {
+        if (!usageGranted()) {
+            askUsageAccess()
+            return
+        }
+        val dir = current
+        selected.clear()
+        items = emptyList()
+        shown = emptyList()
+        scanning = true
+        appsMode = true
+        scanId++
+        val id = scanId
+        refresh()
+        ex.execute {
+            val l = buildApps(dir)
+            h.post {
+                if (id == scanId) {
+                    items = l
+                    scanning = false
+                    refresh()
+                }
+            }
         }
     }
 
@@ -169,6 +316,7 @@ class MainActivity : Activity() {
     }
 
     private fun iconFor(item: Item): String {
+        if (item.virtual) return if (item.file.name == REST) "🧩" else "📱"
         if (item.locked) return "🔒"
         if (item.isDir) return if (item.count == 0) "📂" else "📁"
         return when (extOf(item.file.name)) {
@@ -206,7 +354,6 @@ class MainActivity : Activity() {
 
         page.addView(tv("🗂  خريطة المساحة", 24f, Color.WHITE, true))
 
-        // شريط المسار القابل للضغط + زر النسخ
         val pathRow = LinearLayout(this)
         pathRow.gravity = Gravity.CENTER_VERTICAL
         crumbScroll = HorizontalScrollView(this)
@@ -241,7 +388,6 @@ class MainActivity : Activity() {
         cardLp.bottomMargin = dp(10)
         page.addView(devCard, cardLp)
 
-        // الصف الأول: رجوع - ترتيب - حذف
         val bar1 = LinearLayout(this)
         val backBtn = btn("⬆ رجوع", Color.parseColor("#2B3A57"))
         backBtn.setOnClickListener { goBack() }
@@ -257,13 +403,15 @@ class MainActivity : Activity() {
         bar1.addView(delBtn, toolLp())
         page.addView(bar1)
 
-        // الصف الثاني: التخزين - السلة
         val bar2 = LinearLayout(this)
         val storBtn = btn("💾 التخزين", Color.parseColor("#1F6F8B"))
         storBtn.setOnClickListener { showVolumes() }
+        val appsBtn = btn("📱 التطبيقات", Color.parseColor("#6B4FA0"))
+        appsBtn.setOnClickListener { showApps() }
         val trashBtn = btn("♻ السلة", Color.parseColor("#2E7D5B"))
         trashBtn.setOnClickListener { showTrash() }
         bar2.addView(storBtn, toolLp())
+        bar2.addView(appsBtn, toolLp())
         bar2.addView(trashBtn, toolLp())
         page.addView(bar2)
 
@@ -274,7 +422,7 @@ class MainActivity : Activity() {
         selAll.setOnClickListener {
             selected.clear()
             if (selAll.isChecked) {
-                for (f in items) selected.add(f.file.path)
+                for (f in items) if (!f.virtual) selected.add(f.file.path)
             }
             refresh()
         }
@@ -298,11 +446,14 @@ class MainActivity : Activity() {
         list.adapter = adapter
         list.setOnItemClickListener { _, _, p, _ ->
             val entry = shown[p]
-            if (entry.isDir) {
+            if (entry.virtual) {
+                if (entry.file.name == REST) showApps()
+                else Toast.makeText(this, entry.label ?: "", Toast.LENGTH_LONG).show()
+            } else if (entry.isDir) {
                 if (entry.locked) {
                     Toast.makeText(
                         this,
-                        "🔒 محمي من النظام (يحتاج Shizuku أو روت)",
+                        "🔒 محمي من النظام. يحتاج روت، أو افتح 📱 التطبيقات لرؤية الأحجام",
                         Toast.LENGTH_LONG
                     ).show()
                 } else {
@@ -314,9 +465,11 @@ class MainActivity : Activity() {
         }
         list.setOnItemLongClickListener { _, _, p, _ ->
             val entry = shown[p]
-            if (selected.contains(entry.file.path)) selected.remove(entry.file.path)
-            else selected.add(entry.file.path)
-            refresh()
+            if (!entry.virtual) {
+                if (selected.contains(entry.file.path)) selected.remove(entry.file.path)
+                else selected.add(entry.file.path)
+                refresh()
+            }
             true
         }
         page.addView(list, LinearLayout.LayoutParams(-1, 0, 1f))
@@ -355,10 +508,8 @@ class MainActivity : Activity() {
     }
 
     private fun navigate(dir: File) {
-        if (dir.path != current.path) {
-            stack.add(current)
-            load(dir)
-        }
+        stack.add(current)
+        load(dir)
     }
 
     private fun showVolumes() {
@@ -368,10 +519,13 @@ class MainActivity : Activity() {
             names.add(if (i == 0) "📱 التخزين الداخلي" else "💾 بطاقة ذاكرة: " + vols[i].name)
         }
         names.add("🧭 الجذر /")
+        names.add("🛠 /data (يحتاج روت)")
         AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
             .setTitle("اختر وحدة التخزين")
             .setItems(names.toTypedArray()) { _, which ->
-                if (which < vols.size) navigate(vols[which]) else navigate(File("/"))
+                if (which < vols.size) navigate(vols[which])
+                else if (which == vols.size) navigate(File("/"))
+                else navigate(File("/data"))
             }
             .show()
     }
@@ -379,7 +533,7 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         if (hasAccess()) {
-            if (items.isEmpty() && !scanning) load(current)
+            if (items.isEmpty() && !scanning && !denied) load(current)
         } else {
             statusTv.text = "⚠ اضغط هنا لمنح صلاحية الوصول لكل الملفات"
         }
@@ -390,7 +544,8 @@ class MainActivity : Activity() {
         onResume()
     }
 
-    private fun openFile(f: File) {
+    // ---------- فتح الملفات ----------
+    private fun launch(f: File) {
         try {
             val uri = FileProvider.getUriForFile(this, "$packageName.provider", f)
             val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extOf(f.name)) ?: "*/*"
@@ -405,6 +560,22 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun openFile(f: File) {
+        if (f.canRead()) {
+            launch(f)
+            return
+        }
+        ex.execute {
+            if (hasRoot()) {
+                val tmp = File(cacheDir, "open_" + f.name)
+                sh("cat '" + q(f.path) + "' > '" + q(tmp.path) + "'; chmod 666 '" + q(tmp.path) + "'")
+                h.post { launch(tmp) }
+            } else {
+                h.post { Toast.makeText(this, "🔒 لا يمكن قراءة هذا الملف بدون روت", Toast.LENGTH_LONG).show() }
+            }
+        }
+    }
+
     private fun sortedItems(): List<Item> {
         return if (asc) items.sortedBy { x -> x.size } else items.sortedByDescending { x -> x.size }
     }
@@ -412,6 +583,7 @@ class MainActivity : Activity() {
     private fun row(item: Item): View {
         val pct = item.size * 100.0 / totalDev
         val color = when {
+            item.virtual && item.file.name == REST -> "#A78BFA"
             pct > 25 -> "#EF4444"
             pct > 10 -> "#FB923C"
             pct > 3 -> "#38BDF8"
@@ -437,6 +609,7 @@ class MainActivity : Activity() {
         cb.isChecked = isSel
         cb.isFocusable = false
         cb.buttonTintList = ColorStateList.valueOf(Color.parseColor("#2DD4BF"))
+        if (item.virtual) cb.visibility = View.GONE
         cb.setOnClickListener {
             if (cb.isChecked) selected.add(item.file.path) else selected.remove(item.file.path)
             refresh()
@@ -447,12 +620,19 @@ class MainActivity : Activity() {
         val col = LinearLayout(this)
         col.orientation = LinearLayout.VERTICAL
         col.setPadding(dp(8), 0, dp(8), 0)
-        val nameTv = tv(item.file.name, 15f, Color.WHITE, true)
+        val title = item.label ?: item.file.name
+        val nameTv = tv(title, 15f, Color.WHITE, true)
         nameTv.maxLines = 1
         nameTv.ellipsize = TextUtils.TruncateAt.MIDDLE
         col.addView(nameTv)
-        val sub = if (item.locked)
-            "محمي من النظام"
+        val sub = if (item.virtual && item.file.name == REST)
+            String.format("%.1f%% من الجهاز  •  اضغط لعرض تفصيل التطبيقات", pct)
+        else if (item.virtual)
+            String.format("%.1f%% من الجهاز  •  كود + بيانات + كاش", pct)
+        else if (item.locked)
+            "محمي من النظام (يحتاج روت)"
+        else if (item.isDir && item.count < 0)
+            String.format("%.1f%% من الجهاز  •  مقروء بالروت", pct)
         else if (item.isDir)
             String.format("%.1f%% من الجهاز  •  %d عنصر", pct, item.count)
         else
@@ -488,14 +668,18 @@ class MainActivity : Activity() {
         sortBtn.text = if (asc) "⬆ تصاعدي" else "⬇ تنازلي"
         delBtn.text = "🗑 حذف (${selected.size})"
         delBtn.alpha = if (selected.isEmpty()) 0.4f else 1f
-        selAll.isChecked = items.isNotEmpty() && selected.size == items.size
+        var real = 0
+        for (x in items) if (!x.virtual) real++
+        selAll.isChecked = real > 0 && selected.size == real
 
         var tot = 0L
         for (x in items) tot += x.size
         statusTv.text = if (scanning) "⏳ جاري الحساب…  ${items.size} عنصر"
-        else if (denied) "🔒 هذا المجلد محمي من النظام (يحتاج Shizuku أو روت)"
+        else if (appsMode) "📱 التطبيقات المثبتة  •  ${items.size} تطبيق  •  ${Formatter.formatFileSize(this, tot)}"
+        else if (denied) "🔒 هذا المجلد محمي (يحتاج روت، أو افتح 📱 التطبيقات)"
         else if (items.isEmpty()) "المجلد فارغ"
-        else "الإجمالي هنا: ${Formatter.formatFileSize(this, tot)}  •  ${items.size} عنصر"
+        else "الإجمالي هنا: ${Formatter.formatFileSize(this, tot)}  •  ${items.size} عنصر" +
+                (if (rootState == 1) "  •  🔓 روت" else "")
 
         try {
             val st = StatFs(volumeOf(current).path)
@@ -524,42 +708,90 @@ class MainActivity : Activity() {
         items = emptyList()
         shown = emptyList()
         denied = false
+        appsMode = false
         scanning = true
         scanId++
         val id = scanId
         refresh()
         ex.execute {
-            val kidsArr = dir.listFiles()
-            val den = kidsArr == null
-            val kids = kidsArr?.toList() ?: emptyList()
+            val rootOk = hasRoot()
+            val arr = dir.listFiles()
             val acc = ArrayList<Item>()
-            var last = 0L
-            for (k in kids) {
-                if (id != scanId) return@execute
-                val isD = k.isDirectory
-                var cnt = 0
-                var lock = false
-                if (isD) {
-                    val sub = k.list()
-                    if (sub == null) lock = true else cnt = sub.size
+            var den = false
+            var apps = false
+            if (arr == null) {
+                if (rootOk) {
+                    acc.addAll(rootList(dir))
+                } else if (dir.path.endsWith("/Android/data") && usageGranted()) {
+                    acc.addAll(buildApps(dir))
+                    apps = true
+                } else {
+                    den = true
                 }
-                acc.add(Item(k, calcSize(k, id), isD, cnt, lock))
-                val now = SystemClock.uptimeMillis()
-                if (now - last > 400) {
-                    last = now
-                    val snap = ArrayList(acc)
-                    h.post {
-                        if (id == scanId) {
-                            items = snap
-                            refresh()
+            } else {
+                var last = 0L
+                for (k in arr) {
+                    if (id != scanId) return@execute
+                    val isD = k.isDirectory
+                    var cnt = 0
+                    var lock = false
+                    var size = 0L
+                    var known = false
+                    if (isD) {
+                        val sub = k.list()
+                        if (sub == null) {
+                            if (rootOk) {
+                                cnt = -1
+                                size = rootSize(k)
+                                known = true
+                            } else {
+                                lock = true
+                                known = true
+                            }
+                        } else {
+                            cnt = sub.size
                         }
                     }
+                    if (!known) size = calcSize(k, id)
+                    acc.add(Item(k, size, isD, cnt, lock))
+                    val now = SystemClock.uptimeMillis()
+                    if (now - last > 400) {
+                        last = now
+                        val snap = ArrayList(acc)
+                        h.post {
+                            if (id == scanId) {
+                                items = snap
+                                refresh()
+                            }
+                        }
+                    }
+                }
+            }
+            if (id != scanId) return@execute
+            // بند الباقي ليطابق المجموع المساحة المشغولة
+            if (!apps && !den && dir.path == volumeOf(dir).path) {
+                try {
+                    val st = StatFs(dir.path)
+                    val used = st.totalBytes - st.availableBytes
+                    var sum = 0L
+                    for (x in acc) sum += x.size
+                    val rem = used - sum
+                    if (rem > 0L) {
+                        acc.add(
+                            Item(
+                                File(dir, REST), rem, true, 0, false, true,
+                                "النظام وبيانات التطبيقات (غير مقروء)"
+                            )
+                        )
+                    }
+                } catch (e: Exception) {
                 }
             }
             h.post {
                 if (id == scanId) {
                     items = acc
                     denied = den
+                    appsMode = apps
                     scanning = false
                     refresh()
                 }
@@ -584,6 +816,10 @@ class MainActivity : Activity() {
     }
 
     private fun goBack() {
+        if (appsMode) {
+            load(current)
+            return
+        }
         if (stack.isNotEmpty()) {
             val prev = stack.removeAt(stack.size - 1)
             load(prev)
@@ -595,7 +831,7 @@ class MainActivity : Activity() {
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
-        if (stack.isNotEmpty()) goBack() else super.onBackPressed()
+        if (appsMode || stack.isNotEmpty()) goBack() else super.onBackPressed()
     }
 
     // ---------- الحذف والسلة ----------
@@ -658,12 +894,16 @@ class MainActivity : Activity() {
                 if (mode == 0) {
                     if (!moveToTrash(f)) failed++
                 } else if (mode == 1) {
-                    if (!f.deleteRecursively()) failed++
+                    if (!forceDelete(f)) failed++
                 } else {
                     if (f.isDirectory) {
                         val kids = f.listFiles()
                         if (kids != null) {
-                            for (k in kids) if (!k.deleteRecursively()) failed++
+                            for (k in kids) if (!forceDelete(k)) failed++
+                        } else if (hasRoot()) {
+                            sh("cd '" + q(f.path) + "' && rm -rf ./* ./.[!.]* 2>/dev/null")
+                        } else {
+                            failed++
                         }
                     }
                 }
