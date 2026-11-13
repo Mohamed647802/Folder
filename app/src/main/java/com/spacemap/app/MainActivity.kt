@@ -4,6 +4,9 @@ import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.ActivityNotFoundException
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Color
@@ -27,6 +30,7 @@ import android.webkit.MimeTypeMap
 import android.widget.BaseAdapter
 import android.widget.CheckBox
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
@@ -39,6 +43,7 @@ class Item(val file: File, val size: Long, val isDir: Boolean, val count: Int, v
 
 class MainActivity : Activity() {
 
+    private val TRASH = ".SpaceMapTrash"
     private val ex = Executors.newFixedThreadPool(2)
     private val h = Handler(Looper.getMainLooper())
     private val root: File = Environment.getExternalStorageDirectory()
@@ -50,10 +55,13 @@ class MainActivity : Activity() {
     private var asc = false
     private var scanId = 0
     private var scanning = false
+    private var denied = false
     private var totalDev = 1L
     private var usedDev = 0L
+    private var trashCounter = 0
 
-    private lateinit var pathTv: TextView
+    private lateinit var crumbs: LinearLayout
+    private lateinit var crumbScroll: HorizontalScrollView
     private lateinit var statusTv: TextView
     private lateinit var devTv: TextView
     private lateinit var devBar: LinearLayout
@@ -90,6 +98,13 @@ class MainActivity : Activity() {
         return x
     }
 
+    private fun toolLp(): LinearLayout.LayoutParams {
+        val lp = LinearLayout.LayoutParams(0, -2, 1f)
+        lp.marginEnd = dp(6)
+        lp.bottomMargin = dp(6)
+        return lp
+    }
+
     private fun hasAccess(): Boolean {
         return if (Build.VERSION.SDK_INT >= 30) Environment.isExternalStorageManager()
         else checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == 0
@@ -97,11 +112,16 @@ class MainActivity : Activity() {
 
     private fun requestAccess() {
         if (Build.VERSION.SDK_INT >= 30) {
-            val i = Intent(
-                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                Uri.parse("package:$packageName")
-            )
-            startActivity(i)
+            try {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                        Uri.parse("package:$packageName")
+                    )
+                )
+            } catch (e: Exception) {
+                startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+            }
         } else {
             requestPermissions(
                 arrayOf(
@@ -112,6 +132,37 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---------- وحدات التخزين ----------
+    private fun volumes(): List<File> {
+        val out = ArrayList<File>()
+        out.add(root)
+        try {
+            val dirs = getExternalFilesDirs(null)
+            for (d in dirs) {
+                if (d == null) continue
+                val p = d.absolutePath
+                val i = p.indexOf("/Android/")
+                if (i > 0) {
+                    val v = File(p.substring(0, i))
+                    var exists = false
+                    for (o in out) if (o.path == v.path) exists = true
+                    if (!exists) out.add(v)
+                }
+            }
+        } catch (e: Exception) {
+        }
+        return out
+    }
+
+    private fun volumeOf(f: File): File {
+        var best = root
+        for (v in volumes()) {
+            if (f.path.startsWith(v.path) && v.path.length >= best.path.length) best = v
+        }
+        return best
+    }
+
+    // ---------- الأيقونات ----------
     private fun extOf(name: String): String {
         val i = name.lastIndexOf('.')
         return if (i >= 0 && i < name.length - 1) name.substring(i + 1).lowercase() else ""
@@ -134,6 +185,7 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---------- الواجهة ----------
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         window.statusBarColor = Color.parseColor("#0B1020")
@@ -154,11 +206,24 @@ class MainActivity : Activity() {
 
         page.addView(tv("🗂  خريطة المساحة", 24f, Color.WHITE, true))
 
-        pathTv = tv("", 12f, Color.parseColor("#8FA3BF"))
-        pathTv.maxLines = 1
-        pathTv.ellipsize = TextUtils.TruncateAt.MIDDLE
-        pathTv.setPadding(0, dp(4), 0, dp(10))
-        page.addView(pathTv)
+        // شريط المسار القابل للضغط + زر النسخ
+        val pathRow = LinearLayout(this)
+        pathRow.gravity = Gravity.CENTER_VERTICAL
+        crumbScroll = HorizontalScrollView(this)
+        crumbScroll.layoutDirection = View.LAYOUT_DIRECTION_LTR
+        crumbScroll.isHorizontalScrollBarEnabled = false
+        crumbs = LinearLayout(this)
+        crumbs.layoutDirection = View.LAYOUT_DIRECTION_LTR
+        crumbs.gravity = Gravity.CENTER_VERTICAL
+        crumbScroll.addView(crumbs)
+        val copyBtn = btn("📋", Color.parseColor("#2B3A57"))
+        copyBtn.setOnClickListener { copyPath() }
+        pathRow.addView(crumbScroll, LinearLayout.LayoutParams(0, -2, 1f))
+        pathRow.addView(copyBtn, LinearLayout.LayoutParams(-2, -2))
+        val prLp = LinearLayout.LayoutParams(-1, -2)
+        prLp.topMargin = dp(6)
+        prLp.bottomMargin = dp(10)
+        page.addView(pathRow, prLp)
 
         val devCard = LinearLayout(this)
         devCard.orientation = LinearLayout.VERTICAL
@@ -176,25 +241,31 @@ class MainActivity : Activity() {
         cardLp.bottomMargin = dp(10)
         page.addView(devCard, cardLp)
 
-        val bar = LinearLayout(this)
-        bar.gravity = Gravity.CENTER_VERTICAL
-
+        // الصف الأول: رجوع - ترتيب - حذف
+        val bar1 = LinearLayout(this)
         val backBtn = btn("⬆ رجوع", Color.parseColor("#2B3A57"))
         backBtn.setOnClickListener { goBack() }
-
         sortBtn = btn("", Color.parseColor("#2B3A57"))
         sortBtn.setOnClickListener {
             asc = !asc
             refresh()
         }
-
         delBtn = btn("🗑 حذف", Color.parseColor("#C0392B"))
         delBtn.setOnClickListener { askDelete() }
+        bar1.addView(backBtn, toolLp())
+        bar1.addView(sortBtn, toolLp())
+        bar1.addView(delBtn, toolLp())
+        page.addView(bar1)
 
-        bar.addView(backBtn, toolLp())
-        bar.addView(sortBtn, toolLp())
-        bar.addView(delBtn, toolLp())
-        page.addView(bar)
+        // الصف الثاني: التخزين - السلة
+        val bar2 = LinearLayout(this)
+        val storBtn = btn("💾 التخزين", Color.parseColor("#1F6F8B"))
+        storBtn.setOnClickListener { showVolumes() }
+        val trashBtn = btn("♻ السلة", Color.parseColor("#2E7D5B"))
+        trashBtn.setOnClickListener { showTrash() }
+        bar2.addView(storBtn, toolLp())
+        bar2.addView(trashBtn, toolLp())
+        page.addView(bar2)
 
         selAll = CheckBox(this)
         selAll.text = "تحديد الكل"
@@ -229,10 +300,13 @@ class MainActivity : Activity() {
             val entry = shown[p]
             if (entry.isDir) {
                 if (entry.locked) {
-                    Toast.makeText(this, "🔒 المجلد محمي ولا يمكن قراءته", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(
+                        this,
+                        "🔒 محمي من النظام (يحتاج Shizuku أو روت)",
+                        Toast.LENGTH_LONG
+                    ).show()
                 } else {
-                    stack.add(current)
-                    load(entry.file)
+                    navigate(entry.file)
                 }
             } else {
                 openFile(entry.file)
@@ -251,10 +325,55 @@ class MainActivity : Activity() {
         if (!hasAccess()) requestAccess()
     }
 
-    private fun toolLp(): LinearLayout.LayoutParams {
-        val lp = LinearLayout.LayoutParams(0, -2, 1f)
-        lp.marginEnd = dp(6)
-        return lp
+    // ---------- المسار ----------
+    private fun copyPath() {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("path", current.absolutePath))
+        Toast.makeText(this, "تم نسخ المسار", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun crumb(label: String, path: String): TextView {
+        val c = tv(label, 13f, Color.parseColor("#2DD4BF"), true)
+        c.setPadding(dp(10), dp(8), dp(10), dp(8))
+        c.background = shape(Color.parseColor("#1B2740"), 10)
+        c.setOnClickListener { navigate(File(path)) }
+        return c
+    }
+
+    private fun buildCrumbs() {
+        crumbs.removeAllViews()
+        crumbs.addView(crumb("/", "/"))
+        val parts = current.absolutePath.split("/").filter { s -> s.isNotEmpty() }
+        var acc = ""
+        for (p in parts) {
+            acc += "/" + p
+            val target = acc
+            crumbs.addView(tv(" › ", 14f, Color.parseColor("#8FA3BF")))
+            crumbs.addView(crumb(p, target))
+        }
+        crumbScroll.post { crumbScroll.fullScroll(View.FOCUS_RIGHT) }
+    }
+
+    private fun navigate(dir: File) {
+        if (dir.path != current.path) {
+            stack.add(current)
+            load(dir)
+        }
+    }
+
+    private fun showVolumes() {
+        val vols = volumes()
+        val names = ArrayList<String>()
+        for (i in vols.indices) {
+            names.add(if (i == 0) "📱 التخزين الداخلي" else "💾 بطاقة ذاكرة: " + vols[i].name)
+        }
+        names.add("🧭 الجذر /")
+        AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
+            .setTitle("اختر وحدة التخزين")
+            .setItems(names.toTypedArray()) { _, which ->
+                if (which < vols.size) navigate(vols[which]) else navigate(File("/"))
+            }
+            .show()
     }
 
     override fun onResume() {
@@ -332,7 +451,9 @@ class MainActivity : Activity() {
         nameTv.maxLines = 1
         nameTv.ellipsize = TextUtils.TruncateAt.MIDDLE
         col.addView(nameTv)
-        val sub = if (item.isDir)
+        val sub = if (item.locked)
+            "محمي من النظام"
+        else if (item.isDir)
             String.format("%.1f%% من الجهاز  •  %d عنصر", pct, item.count)
         else
             String.format("%.1f%% من الجهاز  •  اضغط للفتح", pct)
@@ -363,7 +484,7 @@ class MainActivity : Activity() {
     }
 
     private fun refresh() {
-        pathTv.text = current.path
+        buildCrumbs()
         sortBtn.text = if (asc) "⬆ تصاعدي" else "⬇ تنازلي"
         delBtn.text = "🗑 حذف (${selected.size})"
         delBtn.alpha = if (selected.isEmpty()) 0.4f else 1f
@@ -372,15 +493,17 @@ class MainActivity : Activity() {
         var tot = 0L
         for (x in items) tot += x.size
         statusTv.text = if (scanning) "⏳ جاري الحساب…  ${items.size} عنصر"
+        else if (denied) "🔒 هذا المجلد محمي من النظام (يحتاج Shizuku أو روت)"
         else if (items.isEmpty()) "المجلد فارغ"
         else "الإجمالي هنا: ${Formatter.formatFileSize(this, tot)}  •  ${items.size} عنصر"
 
         try {
-            val st = StatFs(root.path)
+            val st = StatFs(volumeOf(current).path)
             totalDev = st.totalBytes
             usedDev = st.totalBytes - st.availableBytes
         } catch (e: Exception) {
         }
+        if (totalDev <= 0L) totalDev = 1L
         val up = usedDev * 100f / totalDev
         devTv.text = "المستخدم ${Formatter.formatFileSize(this, usedDev)} من " +
                 "${Formatter.formatFileSize(this, totalDev)}  (${up.toInt()}%)"
@@ -400,12 +523,14 @@ class MainActivity : Activity() {
         selected.clear()
         items = emptyList()
         shown = emptyList()
+        denied = false
         scanning = true
         scanId++
         val id = scanId
         refresh()
         ex.execute {
             val kidsArr = dir.listFiles()
+            val den = kidsArr == null
             val kids = kidsArr?.toList() ?: emptyList()
             val acc = ArrayList<Item>()
             var last = 0L
@@ -434,6 +559,7 @@ class MainActivity : Activity() {
             h.post {
                 if (id == scanId) {
                     items = acc
+                    denied = den
                     scanning = false
                     refresh()
                 }
@@ -461,6 +587,9 @@ class MainActivity : Activity() {
         if (stack.isNotEmpty()) {
             val prev = stack.removeAt(stack.size - 1)
             load(prev)
+        } else {
+            val par = current.parentFile
+            if (par != null) load(par)
         }
     }
 
@@ -469,33 +598,150 @@ class MainActivity : Activity() {
         if (stack.isNotEmpty()) goBack() else super.onBackPressed()
     }
 
+    // ---------- الحذف والسلة ----------
+    private fun inTrash(): Boolean = current.path.contains(TRASH)
+
     private fun askDelete() {
         if (selected.isEmpty()) {
             Toast.makeText(this, "حدد عنصراً أولاً", Toast.LENGTH_SHORT).show()
             return
         }
-        AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
-            .setTitle("⚠ حذف ${selected.size} عنصر (لا يمكن التراجع)")
-            .setItems(arrayOf("حذف العناصر بالكامل", "حذف المحتويات الداخلية فقط", "إلغاء")) { _, which ->
-                if (which < 2) doDelete(which == 1)
-            }
-            .show()
+        val title = "⚠ ${selected.size} عنصر محدد"
+        if (inTrash()) {
+            AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
+                .setTitle(title)
+                .setItems(arrayOf("💀 حذف نهائي (لا يمكن التراجع)", "إلغاء")) { _, which ->
+                    if (which == 0) doDelete(1)
+                }
+                .show()
+        } else {
+            AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
+                .setTitle(title)
+                .setItems(
+                    arrayOf(
+                        "♻ نقل إلى السلة (يمكن الاسترجاع)",
+                        "💀 حذف نهائي (لا يمكن التراجع)",
+                        "🧹 حذف المحتويات الداخلية نهائياً",
+                        "إلغاء"
+                    )
+                ) { _, which ->
+                    if (which < 3) doDelete(which)
+                }
+                .show()
+        }
     }
 
-    private fun doDelete(contentsOnly: Boolean) {
+    private fun moveToTrash(f: File): Boolean {
+        trashCounter++
+        val dir = File(File(volumeOf(f), TRASH), System.currentTimeMillis().toString() + "_" + trashCounter)
+        if (!dir.mkdirs()) return false
+        try {
+            File(dir, ".orig").writeText(f.absolutePath)
+        } catch (e: Exception) {
+            return false
+        }
+        val dest = File(dir, f.name)
+        if (f.renameTo(dest)) return true
+        return try {
+            f.copyRecursively(dest, true) && f.deleteRecursively()
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun doDelete(mode: Int) {
         val targets = selected.map { path -> File(path) }
         statusTv.text = "⏳ جاري الحذف…"
         ex.execute {
+            var failed = 0
             for (f in targets) {
-                if (contentsOnly) {
+                if (mode == 0) {
+                    if (!moveToTrash(f)) failed++
+                } else if (mode == 1) {
+                    if (!f.deleteRecursively()) failed++
+                } else {
                     if (f.isDirectory) {
                         val kids = f.listFiles()
                         if (kids != null) {
-                            for (k in kids) k.deleteRecursively()
+                            for (k in kids) if (!k.deleteRecursively()) failed++
                         }
                     }
+                }
+            }
+            h.post {
+                if (failed > 0) {
+                    Toast.makeText(this, "تعذر حذف $failed عنصر", Toast.LENGTH_LONG).show()
+                }
+                load(current)
+            }
+        }
+    }
+
+    private fun trashEntries(): List<File> {
+        val out = ArrayList<File>()
+        for (v in volumes()) {
+            val l = File(v, TRASH).listFiles()
+            if (l != null) {
+                for (d in l) if (d.isDirectory && entryFile(d) != null) out.add(d)
+            }
+        }
+        return out
+    }
+
+    private fun entryFile(d: File): File? {
+        val l = d.listFiles() ?: return null
+        for (x in l) if (x.name != ".orig") return x
+        return null
+    }
+
+    private fun showTrash() {
+        val entries = trashEntries()
+        if (entries.isEmpty()) {
+            Toast.makeText(this, "السلة فارغة", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val names = Array(entries.size) { i -> "♻ " + entryFile(entries[i])!!.name }
+        val checked = BooleanArray(entries.size)
+        AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
+            .setTitle("♻ السلة (${entries.size})")
+            .setMultiChoiceItems(names, checked) { _, w, c -> checked[w] = c }
+            .setPositiveButton("استرجاع") { _, _ -> trashAction(entries, checked, true) }
+            .setNegativeButton("حذف نهائي") { _, _ -> trashAction(entries, checked, false) }
+            .setNeutralButton("إغلاق", null)
+            .show()
+    }
+
+    private fun trashAction(entries: List<File>, checked: BooleanArray, restore: Boolean) {
+        statusTv.text = "⏳ جاري التنفيذ…"
+        ex.execute {
+            for (i in entries.indices) {
+                if (!checked[i]) continue
+                val d = entries[i]
+                val ef = entryFile(d)
+                if (ef == null) {
+                    d.deleteRecursively()
+                    continue
+                }
+                if (restore) {
+                    val orig = try {
+                        File(d, ".orig").readText()
+                    } catch (e: Exception) {
+                        ""
+                    }
+                    if (orig.isNotEmpty()) {
+                        var target = File(orig)
+                        if (target.exists()) target = File(target.parentFile, "restored_" + target.name)
+                        target.parentFile?.mkdirs()
+                        if (!ef.renameTo(target)) {
+                            try {
+                                if (ef.copyRecursively(target, true)) ef.deleteRecursively()
+                            } catch (e: Exception) {
+                            }
+                        }
+                    }
+                    if (!ef.exists()) d.deleteRecursively()
                 } else {
-                    f.deleteRecursively()
+                    d.deleteRecursively()
                 }
             }
             h.post { load(current) }
