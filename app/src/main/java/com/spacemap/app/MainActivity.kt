@@ -3,6 +3,7 @@ package com.spacemap.app
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Color
@@ -22,6 +23,7 @@ import android.text.format.Formatter
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.MimeTypeMap
 import android.widget.BaseAdapter
 import android.widget.CheckBox
 import android.widget.FrameLayout
@@ -29,10 +31,11 @@ import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.core.content.FileProvider
 import java.io.File
 import java.util.concurrent.Executors
 
-class Item(val file: File, val size: Long, val isDir: Boolean)
+class Item(val file: File, val size: Long, val isDir: Boolean, val count: Int, val locked: Boolean)
 
 class MainActivity : Activity() {
 
@@ -109,6 +112,28 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun extOf(name: String): String {
+        val i = name.lastIndexOf('.')
+        return if (i >= 0 && i < name.length - 1) name.substring(i + 1).lowercase() else ""
+    }
+
+    private fun iconFor(item: Item): String {
+        if (item.locked) return "🔒"
+        if (item.isDir) return if (item.count == 0) "📂" else "📁"
+        return when (extOf(item.file.name)) {
+            "jpg", "jpeg", "png", "gif", "webp", "bmp", "heic" -> "🖼"
+            "mp4", "mkv", "avi", "mov", "3gp", "webm" -> "🎬"
+            "mp3", "wav", "ogg", "m4a", "aac", "flac", "opus" -> "🎵"
+            "apk", "xapk", "apks" -> "📦"
+            "zip", "rar", "7z", "tar", "gz" -> "🗜"
+            "pdf" -> "📕"
+            "doc", "docx", "txt", "rtf", "odt" -> "📝"
+            "xls", "xlsx", "csv" -> "📊"
+            "ppt", "pptx" -> "📽"
+            else -> "📄"
+        }
+    }
+
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         window.statusBarColor = Color.parseColor("#0B1020")
@@ -135,7 +160,6 @@ class MainActivity : Activity() {
         pathTv.setPadding(0, dp(4), 0, dp(10))
         page.addView(pathTv)
 
-        // بطاقة مساحة الجهاز
         val devCard = LinearLayout(this)
         devCard.orientation = LinearLayout.VERTICAL
         devCard.setPadding(dp(14), dp(12), dp(14), dp(12))
@@ -152,7 +176,6 @@ class MainActivity : Activity() {
         cardLp.bottomMargin = dp(10)
         page.addView(devCard, cardLp)
 
-        // شريط الأدوات
         val bar = LinearLayout(this)
         bar.gravity = Gravity.CENTER_VERTICAL
 
@@ -205,9 +228,22 @@ class MainActivity : Activity() {
         list.setOnItemClickListener { _, _, p, _ ->
             val entry = shown[p]
             if (entry.isDir) {
-                stack.add(current)
-                load(entry.file)
+                if (entry.locked) {
+                    Toast.makeText(this, "🔒 المجلد محمي ولا يمكن قراءته", Toast.LENGTH_SHORT).show()
+                } else {
+                    stack.add(current)
+                    load(entry.file)
+                }
+            } else {
+                openFile(entry.file)
             }
+        }
+        list.setOnItemLongClickListener { _, _, p, _ ->
+            val entry = shown[p]
+            if (selected.contains(entry.file.path)) selected.remove(entry.file.path)
+            else selected.add(entry.file.path)
+            refresh()
+            true
         }
         page.addView(list, LinearLayout.LayoutParams(-1, 0, 1f))
         setContentView(page)
@@ -233,6 +269,21 @@ class MainActivity : Activity() {
     override fun onRequestPermissionsResult(c: Int, p: Array<out String>, r: IntArray) {
         super.onRequestPermissionsResult(c, p, r)
         onResume()
+    }
+
+    private fun openFile(f: File) {
+        try {
+            val uri = FileProvider.getUriForFile(this, "$packageName.provider", f)
+            val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extOf(f.name)) ?: "*/*"
+            val i = Intent(Intent.ACTION_VIEW)
+            i.setDataAndType(uri, mime)
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            startActivity(i)
+        } catch (e: ActivityNotFoundException) {
+            Toast.makeText(this, "لا يوجد تطبيق يفتح هذا النوع من الملفات", Toast.LENGTH_LONG).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "تعذر فتح الملف", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun sortedItems(): List<Item> {
@@ -265,13 +316,14 @@ class MainActivity : Activity() {
 
         val cb = CheckBox(this)
         cb.isChecked = isSel
+        cb.isFocusable = false
         cb.buttonTintList = ColorStateList.valueOf(Color.parseColor("#2DD4BF"))
         cb.setOnClickListener {
             if (cb.isChecked) selected.add(item.file.path) else selected.remove(item.file.path)
             refresh()
         }
 
-        val icon = tv(if (item.isDir) "📁" else "📄", 22f, Color.WHITE)
+        val icon = tv(iconFor(item), 22f, Color.WHITE)
 
         val col = LinearLayout(this)
         col.orientation = LinearLayout.VERTICAL
@@ -280,7 +332,11 @@ class MainActivity : Activity() {
         nameTv.maxLines = 1
         nameTv.ellipsize = TextUtils.TruncateAt.MIDDLE
         col.addView(nameTv)
-        col.addView(tv(String.format("%.1f%% من مساحة الجهاز", pct), 11f, Color.parseColor("#8FA3BF")))
+        val sub = if (item.isDir)
+            String.format("%.1f%% من الجهاز  •  %d عنصر", pct, item.count)
+        else
+            String.format("%.1f%% من الجهاز  •  اضغط للفتح", pct)
+        col.addView(tv(sub, 11f, Color.parseColor("#8FA3BF")))
 
         val sz = tv(Formatter.formatFileSize(this, item.size), 14f, Color.parseColor(color), true)
 
@@ -316,6 +372,7 @@ class MainActivity : Activity() {
         var tot = 0L
         for (x in items) tot += x.size
         statusTv.text = if (scanning) "⏳ جاري الحساب…  ${items.size} عنصر"
+        else if (items.isEmpty()) "المجلد فارغ"
         else "الإجمالي هنا: ${Formatter.formatFileSize(this, tot)}  •  ${items.size} عنصر"
 
         try {
@@ -342,17 +399,26 @@ class MainActivity : Activity() {
         current = dir
         selected.clear()
         items = emptyList()
+        shown = emptyList()
         scanning = true
         scanId++
         val id = scanId
         refresh()
         ex.execute {
-            val kids = dir.listFiles()?.toList() ?: emptyList()
+            val kidsArr = dir.listFiles()
+            val kids = kidsArr?.toList() ?: emptyList()
             val acc = ArrayList<Item>()
             var last = 0L
             for (k in kids) {
                 if (id != scanId) return@execute
-                acc.add(Item(k, calcSize(k, id), k.isDirectory))
+                val isD = k.isDirectory
+                var cnt = 0
+                var lock = false
+                if (isD) {
+                    val sub = k.list()
+                    if (sub == null) lock = true else cnt = sub.size
+                }
+                acc.add(Item(k, calcSize(k, id), isD, cnt, lock))
                 val now = SystemClock.uptimeMillis()
                 if (now - last > 400) {
                     last = now
